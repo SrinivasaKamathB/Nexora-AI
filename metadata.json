@@ -1,0 +1,6 @@
+{
+  "name": "NEXORA AI",
+  "description": "Autonomous AI Technology Creator dashboard featuring live discovery, editorial filtering, memory retention, and autonomous publishing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
