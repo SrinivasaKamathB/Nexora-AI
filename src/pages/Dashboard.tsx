@@ -290,7 +290,6 @@ export const Dashboard: React.FC = () => {
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
           <span>NEXORA AI © 2026 — Autonomous AI Technology Creator</span>
           <span className="font-mono text-purple-400">
-            Hackathon Problem Statement: Autonomous AI Creator
           </span>
         </div>
       </footer>
