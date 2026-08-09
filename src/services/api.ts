@@ -74,7 +74,10 @@ export const agentApi = {
     logs: AgentActivityLog[];
   }> {
     try {
-      const res = await fetch(`${BASE_URL}/api/agent/feed?agentId=${encodeURIComponent(agentId)}`);
+      const res = await fetch(
+  `${BASE_URL}/api/agent/feed?agentId=${encodeURIComponent(agentId)}&_t=${Date.now()}`,
+  { cache: 'no-store' }
+);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       return {

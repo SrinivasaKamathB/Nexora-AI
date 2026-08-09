@@ -395,7 +395,7 @@ export const INITIAL_STATS: AgentStats = {
   topicsRejected: 258,
   acceptanceRate: 24.5, // 24.5% selected, 75.5% rejected
   lastRunTime: 'Just now',
-  nextRunSeconds: 45,
+  nextRunSeconds: 600,
   isAutonomousActive: true,
 };
 

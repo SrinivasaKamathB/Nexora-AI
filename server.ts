@@ -15,7 +15,7 @@ import {
 const app = express();
 
 const PORT = 3001;
-const AUTONOMY_INTERVAL_MS = 45 * 1000;
+const AUTONOMY_INTERVAL_MS = 10 * 60 * 1000;
 const startTime = Date.now();
 
 app.use(express.json());
@@ -34,6 +34,9 @@ let stateStats = { ...INITIAL_STATS };
 let autonomousStarted = false;
 let autonomyTimer: ReturnType<typeof setInterval> | null = null;
 
+// Prevent startup/manual/interval cycles from running concurrently.
+let cycleInProgress = false;
+
 // ============================================================
 // GEMINI
 // ============================================================
@@ -49,42 +52,182 @@ function getGeminiClient(): GoogleGenAI | null {
 }
 
 // ============================================================
+// NORMALIZATION / DUPLICATE DETECTION
+// ============================================================
+
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\d{10,}/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeTitle(value: string): string {
+  let normalized = normalizeText(value);
+
+  // Remove the generic title wrapper used by older versions.
+  normalized = normalized.replace(
+    /^nexora ai technical analysis\s*/,
+    ''
+  );
+
+  // Remove common generic words so "Technical Analysis X" cannot
+  // masquerade as a new topic.
+  normalized = normalized
+    .replace(/^technical analysis\s*/, '')
+    .trim();
+
+  return normalized;
+}
+
+function isGenericGeneratedTitle(title: string): boolean {
+  const normalized = normalizeText(title);
+
+  return (
+    normalized === 'nexora ai technical analysis' ||
+    normalized.startsWith('nexora ai technical analysis ')
+  );
+}
+
+function isDuplicatePost(title: string, text: string): boolean {
+  const incomingTitle = normalizeTitle(title);
+  const incomingText = normalizeText(text);
+
+  return statePosts.some((post) => {
+    const existingTitle = normalizeTitle(post.title);
+    const existingText = normalizeText(post.text);
+
+    // Exact topic match.
+    if (
+      incomingTitle &&
+      existingTitle &&
+      incomingTitle === existingTitle
+    ) {
+      return true;
+    }
+
+    // Exact normalized content match.
+    // This catches the repeated fallback/Gemini response even when
+    // the model changes a timestamp or formatting.
+    if (
+      incomingText &&
+      existingText &&
+      incomingText === existingText
+    ) {
+      return true;
+    }
+
+    return false;
+  });
+}
+
+function getUnusedSeedTopics(): string[] {
+  const fallbackTopics = [
+    'Multi-Agent Memory Architectures',
+    'Autonomous AI Agent Planning',
+    'LLM Context Management Systems',
+    'Agentic Workflow Orchestration',
+    'AI Agent Security and Guardrails',
+    'Multi-Agent Communication Protocols',
+    'Retrieval-Augmented Generation for Agents',
+    'Autonomous Code Generation Systems',
+  ];
+
+  const usedTopicKeys = new Set(
+    statePosts
+      .map((post) => normalizeTitle(post.title))
+      .filter(Boolean)
+  );
+
+  return fallbackTopics.filter(
+    (topic) => !usedTopicKeys.has(normalizeTitle(topic))
+  );
+}
+
+// ============================================================
 // AUTONOMOUS CYCLE
 // ============================================================
 
 async function runAutonomousCycle(topicPrompt?: string) {
-  const ai = getGeminiClient();
+  if (cycleInProgress) {
+    console.log(
+      'NEXORA cycle skipped: another cycle is already running.'
+    );
 
-  let title =
-    topicPrompt ||
-    'Evaluating Multi-Agent State Synchronization Protocols';
+    return {
+      success: false,
+      skipped: true,
+      message:
+        'Autonomous cycle skipped because another cycle is already running',
+    };
+  }
 
-  let postText = '';
-  let rationale = '';
-  let category:
-  | 'AI Agents'
-  | 'LLMs'
-  | 'Security'
-  | 'DevTools'
-  | 'Open Source' = 'AI Agents';
+  cycleInProgress = true;
 
-  // ----------------------------------------------------------
-  // Gemini generation
-  // ----------------------------------------------------------
+  try {
+    const ai = getGeminiClient();
 
-  if (ai) {
+    // Do not manufacture/publish a post when Gemini is unavailable.
+    // That was the source of the repeated fake-looking posts.
+    if (!ai) {
+      console.error(
+        'GEMINI_API_KEY is missing or invalid. No post will be published.'
+      );
+
+      return {
+        success: false,
+        skipped: true,
+        aiUnavailable: true,
+        message:
+          'Gemini is not configured. No post was published.',
+      };
+    }
+
+    const unusedTopics = getUnusedSeedTopics();
+
+    const selectedSeed =
+      topicPrompt?.trim() ||
+      unusedTopics[0] ||
+      'Emerging AI Agent Engineering';
+
+    let requestedTopic = selectedSeed;
+    let title = '';
+    let postText = '';
+    let rationale = '';
+    let category:
+      | 'AI Agents'
+      | 'LLMs'
+      | 'Security'
+      | 'DevTools'
+      | 'Open Source' = 'AI Agents';
+
+    // ----------------------------------------------------------
+    // Gemini generation
+    // ----------------------------------------------------------
+
     try {
       const prompt = `
 You are NEXORA, an autonomous AI Technology Creator.
 
-Evaluate this technical topic:
+Create ONE genuinely new technical publication about this topic:
 
-"${title}"
+"${requestedTopic}"
 
-Generate ONLY valid JSON with these fields:
+Important uniqueness rules:
+- Do not reuse a previous publication.
+- Do not use a generic title such as "NEXORA AI Technical Analysis".
+- Do not put timestamps, random numbers, IDs, or dates in the title.
+- The title must identify the actual technical subject.
+- Do not repeat the same explanation used for a previous post.
+- If the requested topic is already covered, choose a closely related but distinct technical angle.
+
+Generate ONLY valid JSON with exactly these fields:
 
 {
-  "title": "high-impact technical title",
+  "title": "specific technical title with no timestamp or random number",
   "text": "approximately 250 words of technical analysis",
   "rationale": "why an autonomous AI system selected this topic",
   "category": "one of AI Agents, LLMs, Security, DevTools, Open Source"
@@ -93,172 +236,254 @@ Generate ONLY valid JSON with these fields:
 The text should:
 - Be technically useful
 - Use NEXORA's editorial voice
-- Include bullet points where appropriate
-- Include a short code snippet if relevant
-- Avoid unsupported claims
+- Use concise sections or bullet points where appropriate
+- Include a short code snippet only if relevant
+- Avoid unsupported numerical claims
+- Avoid fabricated citations
 - Return ONLY JSON
 `;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-lite',
+        model: 'gemini-3.5-flash-lite',
         contents: prompt,
       });
 
       const rawText = response.text || '';
 
       const cleanedJson = rawText
-        .replace(/```json/g, '')
+        .replace(/```json/gi, '')
         .replace(/```/g, '')
         .trim();
 
       const parsed = JSON.parse(cleanedJson);
 
-      title = parsed.title || title;
-      postText = parsed.text || '';
-      rationale = parsed.rationale || '';
+      title =
+        typeof parsed.title === 'string'
+          ? parsed.title.trim()
+          : '';
+
+      postText =
+        typeof parsed.text === 'string'
+          ? parsed.text.trim()
+          : '';
+
+      rationale =
+        typeof parsed.rationale === 'string'
+          ? parsed.rationale.trim()
+          : '';
+
       const allowedCategories = [
-  'AI Agents',
-  'LLMs',
-  'Security',
-  'DevTools',
-  'Open Source',
-] as const;
+        'AI Agents',
+        'LLMs',
+        'Security',
+        'DevTools',
+        'Open Source',
+      ] as const;
 
-category = allowedCategories.includes(parsed.category)
-  ? parsed.category
-  : 'AI Agents';
+      category = allowedCategories.includes(parsed.category)
+        ? parsed.category
+        : 'AI Agents';
+
+      // If Gemini returns the old generic timestamp-style title,
+      // use the actual requested topic instead.
+      if (!title || isGenericGeneratedTitle(title)) {
+        title = requestedTopic;
+      }
+
+      if (!postText) {
+        throw new Error(
+          'Gemini returned no publication text.'
+        );
+      }
+
+      if (!rationale) {
+        rationale =
+          'Selected during an autonomous run cycle based on technical relevance and topic diversity.';
+      }
     } catch (error) {
-      console.error('GEMINI GENERATION ERROR:', error);
+      const status =
+        typeof error === 'object' &&
+        error !== null &&
+        'status' in error
+          ? Number((error as { status?: unknown }).status)
+          : undefined;
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        'GEMINI GENERATION ERROR:',
+        status ? `HTTP ${status}` : '',
+        message
+      );
+
+      // CRITICAL:
+      // Never create a fake fallback publication after an AI failure.
+      // In particular, do not publish the same hard-coded text again.
+      if (status === 429 || /429|rate.?limit|quota/i.test(message)) {
+        return {
+          success: false,
+          skipped: true,
+          rateLimited: true,
+          message:
+            'Gemini rate limit reached. No post was published.',
+        };
+      }
+
+      return {
+        success: false,
+        skipped: true,
+        generationFailed: true,
+        message:
+          'Gemini generation failed. No post was published.',
+      };
     }
-  }
 
-  // ----------------------------------------------------------
-  // Fallback generation
-  // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    // Final validation before publishing
+    // ----------------------------------------------------------
 
-  if (!postText) {
-    postText = `
-State synchronization across multi-agent clusters requires deterministic event logs and CRDT-based coordination.
+    if (!title || !postText) {
+      return {
+        success: false,
+        skipped: true,
+        generationFailed: true,
+        message:
+          'Generated publication was empty. No post was published.',
+      };
+    }
 
-Key Architectural Insights:
+    if (isGenericGeneratedTitle(title)) {
+      console.log(
+        `Generic generated title rejected: "${title}"`
+      );
 
-1. Delta-Based Context Diffing:
-Transmitting JSON-patch payloads instead of complete conversation histories can significantly reduce inter-node communication overhead.
+      return {
+        success: false,
+        skipped: true,
+        duplicate: true,
+        message:
+          'Generic generated title rejected. No post was published.',
+      };
+    }
 
-2. Conflict-Free Agent Memory:
-Conflict resolution mechanisms such as LWW registers can reduce race conditions during parallel sub-agent reasoning.
+    if (isDuplicatePost(title, postText)) {
+      console.log(
+        `Duplicate topic/content rejected: "${title}"`
+      );
 
-\`\`\`typescript
-interface AgentStatePatch {
-  nodeId: string;
-  sequence: number;
-  patch: Array<{
-    op: 'add' | 'replace';
-    path: string;
-    value: unknown;
-  }>;
-}
-\`\`\`
-`.trim();
+      stateStats.topicsRejected += 1;
 
-    rationale =
-      'Selected during autonomous run cycle based on technical significance and relevance to multi-agent distributed systems.';
-  }
+      return {
+        success: false,
+        skipped: true,
+        duplicate: true,
+        message:
+          `Duplicate topic/content rejected: "${title}"`,
+      };
+    }
 
-  // ----------------------------------------------------------
-  // Create post
-  // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    // Create post
+    // ----------------------------------------------------------
 
-  const timestamp = Date.now();
+    const timestamp = Date.now();
 
-  const newPost = {
-    id: `p_${timestamp}`,
-    topicId: `t-${timestamp}`,
-    title,
-    createdAt: new Date().toISOString(),
-    text: postText,
-    rationale,
+    const newPost = {
+      id: `p_${timestamp}`,
+      topicId: `t-${timestamp}`,
+      title,
+      createdAt: new Date().toISOString(),
+      text: postText,
+      rationale,
 
-    sources: [
-      {
-        name: 'arXiv: Multi-Agent State Synchronization',
-        url: 'https://arxiv.org/',
+      sources: [
+        {
+          name: 'arXiv',
+          url: 'https://arxiv.org/',
+        },
+        {
+          name: 'GitHub',
+          url: 'https://github.com/',
+        },
+      ],
+
+      tags: [
+        'AIAgents',
+        'StateSync',
+        'DistributedSystems',
+        'LLMInfra',
+      ],
+
+      category,
+
+      engagement: {
+        views: 42,
+        likes: 8,
+        shares: 2,
+        bookmarks: 5,
       },
-      {
-        name: 'GitHub',
-        url: 'https://github.com/',
-      },
-    ],
 
-    tags: [
-      'AIAgents',
-      'StateSync',
-      'DistributedSystems',
-      'LLMInfra',
-    ],
+      status: 'Published' as const,
 
-    category,
+      memoryHash: `mem_${Math.random()
+        .toString(16)
+        .substring(2, 9)}`,
 
-    engagement: {
-      views: 42,
-      likes: 8,
-      shares: 2,
-      bookmarks: 5,
-    },
+      technicalDepthScore: 9.6,
+    };
 
-    status: 'Published' as const,
+    // ----------------------------------------------------------
+    // Update runtime state
+    // ----------------------------------------------------------
 
-    memoryHash: `mem_${Math.random()
-      .toString(16)
-      .substring(2, 9)}`,
+    statePosts = [newPost, ...statePosts];
 
-    technicalDepthScore: 9.6,
-  };
+    stateStats.postsPublished += 1;
+    stateStats.topicsAnalyzed += 3;
+    stateStats.lastRunTime = 'Just now';
+    stateStats.nextRunSeconds = 600;
 
-  // ----------------------------------------------------------
-  // Update runtime state
-  // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    // Activity log
+    // ----------------------------------------------------------
 
-  statePosts = [newPost, ...statePosts];
+    const newLog = {
+      id: `log-${timestamp}`,
 
-  stateStats.postsPublished += 1;
-  stateStats.topicsAnalyzed += 3;
-  stateStats.topicsRejected += 2;
-  stateStats.lastRunTime = 'Just now';
-  stateStats.nextRunSeconds = 45;
+      timestamp: new Date().toLocaleTimeString('en-US', {
+        hour12: false,
+      }),
 
-  // ----------------------------------------------------------
-  // Activity log
-  // ----------------------------------------------------------
+      step: 'PUBLISH' as const,
 
-  const newLog = {
-    id: `log-${timestamp}`,
+      message:
+        `Autonomous cycle completed. Published post: "${title}"`,
 
-    timestamp: new Date().toLocaleTimeString('en-US', {
-      hour12: false,
-    }),
+      detail:
+        `Persisted to vector memory store ${newPost.memoryHash}`,
 
-    step: 'PUBLISH' as const,
+      level: 'success' as const,
+    };
 
-    message: `Autonomous cycle completed. Published post: "${title}"`,
+    stateLogs = [newLog, ...stateLogs];
 
-    detail: `Persisted to vector memory store ${newPost.memoryHash}`,
+    console.log(
+      `NEXORA autonomous cycle completed: "${title}"`
+    );
 
-    level: 'success' as const,
-  };
-
-  stateLogs = [newLog, ...stateLogs];
-
-  console.log(
-    `NEXORA autonomous cycle completed: "${title}"`
-  );
-
-  return {
-    success: true,
-    newPost,
-    newLog,
-    message: 'Autonomous run cycle executed successfully',
-  };
+    return {
+      success: true,
+      newPost,
+      newLog,
+      message:
+        'Autonomous run cycle executed successfully',
+    };
+  } finally {
+    cycleInProgress = false;
+  }
 }
 
 // ============================================================
@@ -274,21 +499,25 @@ async function startAutonomousAgent() {
   stateStats.isAutonomousActive = true;
 
   console.log('NEXORA autonomous agent started');
-  console.log('Autonomous cycle interval: 45 seconds');
+  console.log('Autonomous cycle interval: 600 seconds');
 
-  // Run immediately on startup
   try {
     await runAutonomousCycle();
   } catch (error) {
-    console.error('Initial autonomous cycle error:', error);
+    console.error(
+      'Initial autonomous cycle error:',
+      error
+    );
   }
 
-  // Continue every 45 seconds
   autonomyTimer = setInterval(async () => {
     try {
       await runAutonomousCycle();
     } catch (error) {
-      console.error('Autonomous cycle error:', error);
+      console.error(
+        'Autonomous cycle error:',
+        error
+      );
     }
   }, AUTONOMY_INTERVAL_MS);
 }
@@ -297,7 +526,6 @@ async function startAutonomousAgent() {
 // API ENDPOINTS
 // ============================================================
 
-// 1. Initialize agent
 app.post('/api/agent/init', (req, res) => {
   const { agentId } = req.body || {};
 
@@ -306,12 +534,12 @@ app.post('/api/agent/init', (req, res) => {
     name: 'NEXORA AI',
     status: 'ACTIVE',
     isAutonomousActive: stateStats.isAutonomousActive,
-    message: 'NEXORA Autonomous Agent Session Initialized',
+    message:
+      'NEXORA Autonomous Agent Session Initialized',
     timestamp: new Date().toISOString(),
   });
 });
 
-// 2. Get feed
 app.get('/api/agent/feed', (req, res) => {
   const { agentId } = req.query;
 
@@ -326,29 +554,37 @@ app.get('/api/agent/feed', (req, res) => {
   });
 });
 
-// 3. Get status
 app.get('/api/agent/status', (_req, res) => {
   const ai = getGeminiClient();
 
   res.json({
     serverTime: new Date().toISOString(),
-
     geminiKeyConfigured: !!ai,
-
     uptimeSeconds: Math.floor(
       (Date.now() - startTime) / 1000
     ),
-
     stats: stateStats,
   });
 });
 
-// 4. Manually trigger cycle
 app.post('/api/agent/run-cycle', async (req, res) => {
   try {
     const { topicPrompt } = req.body || {};
 
-    const result = await runAutonomousCycle(topicPrompt);
+    const result = await runAutonomousCycle(
+      topicPrompt
+    );
+
+    if (result?.skipped && !result?.duplicate) {
+      const statusCode = result?.rateLimited
+        ? 429
+        : result?.aiUnavailable
+          ? 503
+          : 409;
+
+      res.status(statusCode).json(result);
+      return;
+    }
 
     res.json(result);
   } catch (error) {
@@ -383,12 +619,17 @@ async function startServer() {
 
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(
+      process.cwd(),
+      'dist'
+    );
 
     app.use(express.static(distPath));
 
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(
+        path.join(distPath, 'index.html')
+      );
     });
   }
 
@@ -403,5 +644,4 @@ async function startServer() {
 
 startServer();
 
-// Prevent unused-variable warnings while keeping timer reference.
 void autonomyTimer;

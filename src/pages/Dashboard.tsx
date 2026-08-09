@@ -40,15 +40,27 @@ export const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<AgentStats>(INITIAL_STATS);
   const [persona, setPersona] = useState<PersonaConfig>(INITIAL_PERSONA);
 
-  // Initialize from backend or load feed
-  useEffect(() => {
-    agentApi.initAgent();
+  // Initialize from backend and keep feed synchronized
+useEffect(() => {
+  agentApi.initAgent();
+
+  const loadFeed = () => {
+    console.log("🔄 FRONTEND FETCHING FEED", new Date().toLocaleTimeString());
     agentApi.getFeed().then((feed) => {
       if (feed.posts && feed.posts.length > 0) {
         setPosts(feed.posts);
       }
     });
-  }, []);
+  };
+
+  // Load immediately
+  loadFeed();
+
+  // Refresh feed every 10 seconds
+  const feedTimer = setInterval(loadFeed, 10000);
+
+  return () => clearInterval(feedTimer);
+}, []);
 
   // Trigger Autonomous Cycle
   const handleTriggerCycle = useCallback(async (customPrompt?: string) => {
@@ -108,7 +120,7 @@ export const Dashboard: React.FC = () => {
           postsPublished: prev.postsPublished + 1,
           topicsAnalyzed: prev.topicsAnalyzed + 3,
           topicsRejected: prev.topicsRejected + 2,
-          nextRunSeconds: 45,
+          nextRunSeconds: 600
         }));
       }
     } catch (err) {
@@ -118,31 +130,36 @@ export const Dashboard: React.FC = () => {
     }
   }, [isCycling]);
 
-  // Autonomous Timer Countdown Loop
-  useEffect(() => {
-    if (!stats.isAutonomousActive) return;
+// Autonomous Timer Countdown Display// Autonomous Timer Countdown Display
+useEffect(() => {
+  if (!stats.isAutonomousActive) return;
 
-    const timer = setInterval(() => {
-      setStats((prev) => {
-        if (prev.nextRunSeconds <= 1) {
-          // Trigger cycle automatically!
-          handleTriggerCycle();
-          return { ...prev, nextRunSeconds: 45 };
-        }
-        return { ...prev, nextRunSeconds: prev.nextRunSeconds - 1 };
-      });
-    }, 1000);
+  const timer = setInterval(() => {
+    setStats((prev) => {
+      if (prev.nextRunSeconds <= 1) {
+        return {
+          ...prev,
+          nextRunSeconds: 600,
+        };
+      }
 
-    return () => clearInterval(timer);
-  }, [stats.isAutonomousActive, handleTriggerCycle]);
+      return {
+        ...prev,
+        nextRunSeconds: prev.nextRunSeconds - 1,
+      };
+    });
+  }, 1000);
 
-  // Toggle Autonomous mode
-  const handleToggleAutonomous = () => {
-    setStats((prev) => ({
-      ...prev,
-      isAutonomousActive: !prev.isAutonomousActive,
-    }));
-  };
+  return () => clearInterval(timer);
+}, [stats.isAutonomousActive]);
+
+// Toggle Autonomous mode
+const handleToggleAutonomous = () => {
+  setStats((prev) => ({
+    ...prev,
+    isAutonomousActive: !prev.isAutonomousActive,
+  }));
+};
 
   // Reset System Memory State
   const handleResetData = () => {
